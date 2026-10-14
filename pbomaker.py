@@ -456,7 +456,7 @@ def pack_pbo_binary(src_dir, output_pbo_path, prefix_name):
     dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git")]
     for name in names:
       ext = os.path.splitext(name)[1].lower()
-      if name in ("README.md", "mod.cpp", "meta.cpp") or ext in (
+      if name in ("README.md", "mod.cpp", "meta.cpp", "_unpbo_manifest.json") or ext in (
           ".md", ".pyc", ".pyo", ".bak", ".pbo"
       ):
         continue
@@ -488,8 +488,8 @@ def pack_pbo_binary(src_dir, output_pbo_path, prefix_name):
     buf += rel.encode("utf-8") + b"\x00"
     buf += struct.pack("<IIIII", 0, 0, 0, int(os.path.getmtime(full)), len(content))
 
-  # 5. End of file entries
-  buf += b"\x00"
+  # 5. Terminating entry: empty filename + 5 zero fields (20 bytes)
+  buf += b"\x00" + b"\x00" * 20
 
   # 6. File data
   for content in contents:
