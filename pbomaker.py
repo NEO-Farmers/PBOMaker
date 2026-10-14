@@ -1,6 +1,7 @@
 import os
 import shutil
 import struct
+import hashlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 
@@ -181,7 +182,7 @@ class DayZPBOPackerApp:
     ToolTip(
         self.ent_prefix,
         "The identifier prefix written inside the PBO header required by"
-        " DayZ.",
+        " DayZ. Must match the PBO filename (e.g. SecondWind).",
     )
 
     # Pack Button
@@ -353,6 +354,10 @@ class DayZPBOPackerApp:
     target = self.basic_target_var.get()
     prefix = self.basic_prefix_var.get()
     if not target or not os.path.isdir(target):
+      target = self.basic_folder_var.get().strip()
+    if not prefix:
+      prefix = os.path.basename(target)
+    if not target or not os.path.isdir(target):
       messagebox.showerror("Error", "No valid target folder selected to pack!")
       return
 
@@ -363,8 +368,10 @@ class DayZPBOPackerApp:
     )
     if out_file:
       pack_pbo_binary(target, out_file, prefix)
+      ok, info = verify_pbo(out_file)
       messagebox.showinfo(
-          "Success", f"Packed DayZ PBO successfully!\n{out_file}"
+          "Success",
+          f"Packed DayZ PBO successfully!\n{out_file}\n{info}",
       )
 
   # ------------------------------------------------------------------
@@ -433,50 +440,86 @@ class DayZPBOPackerApp:
           "Error", "Please provide valid source and output paths."
       )
       return
+    if not prefix:
+      prefix = os.path.basename(os.path.normpath(src))
     pack_pbo_binary(src, out, prefix)
-    messagebox.showinfo("Success", "PBO successfully packed.")
+    ok, info = verify_pbo(out)
+    messagebox.showinfo("Success", f"PBO successfully packed.\n{info}")
 
 
 # ----------------------------------------------------------------------
-# HELPER: PBO BINARY BUILDER ENGINE
+# HELPER: PBO BINARY BUILDER ENGINE (correct DayZ format)
 # ----------------------------------------------------------------------
 def pack_pbo_binary(src_dir, output_pbo_path, prefix_name):
-  files_to_pack = []
-  for root, dirs, files in os.walk(src_dir):
-    for file in files:
-      full = os.path.join(root, file)
-      rel = os.path.relpath(full, src_dir).replace("\\", "/")
-      files_to_pack.append((full, rel))
+  files = []
+  for root, dirs, names in os.walk(src_dir):
+    dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git")]
+    for name in names:
+      ext = os.path.splitext(name)[1].lower()
+      if name in ("README.md", "mod.cpp", "meta.cpp") or ext in (
+          ".md", ".pyc", ".pyo", ".bak", ".pbo"
+      ):
+        continue
+      full = os.path.join(root, name)
+      rel = os.path.relpath(full, src_dir).replace("/", "\\")
+      files.append((rel, full))
+  files.sort(key=lambda x: x[0].lower())
+
+  buf = bytearray()
+
+  # 1. "Vers" product entry: 0x00 + "sreV" + 16 zero bytes
+  buf += b"\x00" + b"sreV" + b"\x00" * 16
+
+  # 2. Prefix product entry
+  buf += b"product\x00"
+  buf += b"dayz ugc\x00"
+  buf += b"prefix\x00"
+  buf += prefix_name.encode("utf-8") + b"\x00"
+
+  # 3. End of product entries
+  buf += b"\x00"
+
+  # 4. File entries: name\0 + [0, 0, 0, timestamp, dataSize]
+  contents = []
+  for rel, full in files:
+    with open(full, "rb") as f:
+      content = f.read()
+    contents.append(content)
+    buf += rel.encode("utf-8") + b"\x00"
+    buf += struct.pack("<IIIII", 0, 0, 0, int(os.path.getmtime(full)), len(content))
+
+  # 5. End of file entries
+  buf += b"\x00"
+
+  # 6. File data
+  for content in contents:
+    buf += content
+
+  # 7. Footer: null byte + SHA-1 of everything above it
+  buf += b"\x00" + hashlib.sha1(bytes(buf)).digest()
 
   with open(output_pbo_path, "wb") as pbo:
-    if prefix_name:
-      pbo.write(b"prefix\x00")
-      pbo.write(struct.pack("<I", 0x554350FF))
-      pbo.write(struct.pack("<I", len(prefix_name) + 1))
-      pbo.write(struct.pack("<I", 0))
-      pbo.write(struct.pack("<I", 0))
-      pbo.write(struct.pack("<I", len(prefix_name) + 1))
+    pbo.write(bytes(buf))
 
-    cache = []
-    for full_path, rel_path in files_to_pack:
-      with open(full_path, "rb") as f:
-        content = f.read()
-      cache.append((rel_path, content))
 
-      pbo.write(rel_path.encode("utf-8") + b"\x00")
-      pbo.write(struct.pack("<I", 0x00000000))
-      pbo.write(struct.pack("<I", len(content)))
-      pbo.write(struct.pack("<I", 0))
-      pbo.write(struct.pack("<I", int(os.path.getmtime(full_path))))
-      pbo.write(struct.pack("<I", len(content)))
+def verify_pbo(output_pbo_path):
+  try:
+    with open(output_pbo_path, "rb") as f:
+      data = f.read()
+  except Exception as e:
+    return False, f"Could not read PBO: {e}"
 
-    pbo.write(b"\x00" + (b"\x00" * 21))
+  if len(data) < 22:
+    return False, f"PBO too small ({len(data)} bytes) - packing likely failed."
 
-    if prefix_name:
-      pbo.write(prefix_name.encode("utf-8") + b"\x00")
+  body_len = len(data) - 21
+  if data[body_len] != 0:
+    return False, "PBO footer missing."
 
-    for rel_path, content in cache:
-      pbo.write(content)
+  stored = data[body_len + 1:]
+  calc = hashlib.sha1(data[:body_len]).digest()
+  ok = (stored == calc)
+  return ok, f"{len(data)} bytes, SHA-1 {'OK' if ok else 'MISMATCH'}"
 
 
 if __name__ == "__main__":
